@@ -13,6 +13,7 @@ The SPMT portal uses a JavaScript calendar/datepicker where:
   ⬜ Grey  = No slots / Holiday
 """
 
+import os
 import asyncio
 import logging
 import re
@@ -108,16 +109,23 @@ class SPMTScraper:
         """Start Playwright and launch browser if needed."""
         if self._browser is None or not self._browser.is_connected():
             self._playwright = await async_playwright().start()
-            self._browser = await self._playwright.chromium.launch(
-                headless=True,
-                args=[
+            
+            executable_path = os.getenv("CHROMIUM_EXECUTABLE_PATH")
+            launch_args = {
+                "headless": True,
+                "args": [
                     "--no-sandbox",
                     "--disable-dev-shm-usage",
                     "--disable-gpu",
                     "--disable-extensions",
                     "--disable-background-networking",
                 ],
-            )
+            }
+            if executable_path:
+                launch_args["executable_path"] = executable_path
+                logger.info(f"Using custom Chromium path: {executable_path}")
+
+            self._browser = await self._playwright.chromium.launch(**launch_args)
             logger.info("Browser launched")
         return self._browser
 
