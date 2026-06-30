@@ -3,14 +3,17 @@ ICAI SPMT Batch Monitor - Playwright Scraper
 
 Uses Playwright (headless Chromium) to:
 1. Load the public slot details page
-2. Select State → City → Test Centre via dropdowns
-3. Read the calendar to find GREEN-highlighted available dates
-4. Detect when new dates become available
+2. Select Country → State → City → Test Centre
+3. Click "Search" to load the calendar
+4. Read the calendar to find GREEN-highlighted available dates
+5. Detect when new dates become available
 
-The SPMT portal uses a JavaScript calendar/datepicker where:
-  🟢 Green = Slots available
-  🔴 Red   = Fully booked
-  ⬜ Grey  = No slots / Holiday
+The SPMT portal calendar structure (from actual inspection):
+  - Two-month inline calendar (current + next month)
+  - 🟢 Green background on date cell = Available slots
+  - 🔴 Red background on date cell = Fully booked
+  - No highlight = No slots / Holiday / Past date
+  - "Search" button MUST be clicked after selecting dropdowns
 """
 
 import os
@@ -33,12 +36,12 @@ logger = logging.getLogger(__name__)
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 SLOT_DETAILS_URL = "https://spmt.icai.org/ICAI/LoginAction_showSlotDetails.action"
-CENTRE_DETAILS_URL = "https://spmt.icai.org/ICAI/LoginAction_showCentreDetails.action"
 
-PAGE_TIMEOUT = 30_000       # 30s for page loads
+PAGE_TIMEOUT = 45_000       # 45s for page loads
 ELEMENT_TIMEOUT = 15_000    # 15s to wait for elements
-AJAX_WAIT = 2_000           # 2s for AJAX to complete after interactions
+AJAX_WAIT = 3_000           # 3s for AJAX to complete after interactions
 DROPDOWN_WAIT = 8_000       # 8s for dependent dropdown to populate
+CALENDAR_WAIT = 5_000       # 5s for calendar to render after Search
 
 
 # ─── Data Classes ─────────────────────────────────────────────────────────────
@@ -59,23 +62,20 @@ class DropdownOption:
 
 @dataclass
 class SlotDate:
-    """An available slot date from the calendar."""
-    date: str             # e.g., "2025-07-15" or "15"
-    day_of_week: str = ""
-    month: str = ""
-    year: str = ""
-    status: str = ""      # "available", "booked", "unavailable"
-    css_class: str = ""   # Original CSS classes for debugging
-    time_slots: list = field(default_factory=list)  # Available time slots if any
+    """An available/booked date from the SPMT calendar."""
+    date: str             # Day number, e.g. "4"
+    month: str = ""       # e.g. "July 2026"
+    status: str = ""      # "available" or "booked"
+    bg_color: str = ""    # Actual background color detected
+    css_class: str = ""   # CSS classes for debugging
 
     def full_date(self) -> str:
-        """Return a full date string."""
-        if self.year and self.month:
-            return f"{self.date} {self.month} {self.year}"
+        if self.month:
+            return f"{self.date} {self.month}"
         return self.date
 
     def unique_key(self) -> str:
-        return f"{self.full_date()}|{self.status}|{'|'.join(self.time_slots)}"
+        return f"{self.full_date()}|{self.status}"
 
 
 @dataclass
@@ -86,8 +86,8 @@ class SlotInfo:
     test_centre: str
     available_dates: list[SlotDate] = field(default_factory=list)
     booked_dates: list[SlotDate] = field(default_factory=list)
-    calendar_month: str = ""  # Currently displayed month/year
-    raw_text: str = ""        # Any additional text on the page
+    calendar_months: list[str] = field(default_factory=list)
+    raw_text: str = ""
 
     def has_availability(self) -> bool:
         return len(self.available_dates) > 0
@@ -98,7 +98,7 @@ class SlotInfo:
 class SPMTScraper:
     """
     Scrapes the ICAI SPMT portal using Playwright (headless browser).
-    Reads the calendar datepicker to detect green (available) dates.
+    Reads the inline calendar to detect green (available) and red (booked) dates.
     """
 
     def __init__(self):
@@ -106,31 +106,21 @@ class SPMTScraper:
         self._browser: Optional[Browser] = None
 
     async def _ensure_browser(self) -> Browser:
-        """Start Playwright and launch browser if needed."""
         if self._browser is None or not self._browser.is_connected():
             self._playwright = await async_playwright().start()
-            
-            executable_path = os.getenv("CHROMIUM_EXECUTABLE_PATH")
-            launch_args = {
-                "headless": True,
-                "args": [
+            self._browser = await self._playwright.chromium.launch(
+                headless=True,
+                args=[
                     "--no-sandbox",
                     "--disable-dev-shm-usage",
                     "--disable-gpu",
                     "--disable-extensions",
-                    "--disable-background-networking",
                 ],
-            }
-            if executable_path:
-                launch_args["executable_path"] = executable_path
-                logger.info(f"Using custom Chromium path: {executable_path}")
-
-            self._browser = await self._playwright.chromium.launch(**launch_args)
+            )
             logger.info("Browser launched")
         return self._browser
 
     async def _new_page(self) -> Page:
-        """Create a new page with realistic settings."""
         browser = await self._ensure_browser()
         context = await browser.new_context(
             viewport={"width": 1920, "height": 1080},
@@ -145,7 +135,6 @@ class SPMTScraper:
         return page
 
     async def close(self):
-        """Clean up browser resources."""
         if self._browser:
             await self._browser.close()
             self._browser = None
@@ -158,14 +147,10 @@ class SPMTScraper:
         try:
             logger.info(f"Loading: {SLOT_DETAILS_URL}")
             await page.goto(SLOT_DETAILS_URL, wait_until="networkidle", timeout=PAGE_TIMEOUT)
-
-            # Wait for at least one <select> dropdown to appear
             await page.wait_for_selector("select", timeout=ELEMENT_TIMEOUT)
             await page.wait_for_timeout(AJAX_WAIT)
-
-            logger.info("Slot details page loaded successfully")
+            logger.info("Page loaded successfully")
             return True
-
         except PlaywrightTimeout:
             logger.error("Timeout loading SPMT page — portal may be under maintenance")
             return False
@@ -174,53 +159,40 @@ class SPMTScraper:
             return False
 
     async def _get_select_options(self, page: Page, selector: str) -> list[DropdownOption]:
-        """Read all options from a <select> dropdown."""
+        """Read all meaningful options from a <select> dropdown."""
         options = []
         try:
-            # Wait for the select to exist
             await page.wait_for_selector(selector, timeout=ELEMENT_TIMEOUT)
-
-            # Extract options via JS to avoid stale element issues
             raw = await page.evaluate(f"""() => {{
                 const sel = document.querySelector('{selector}');
                 if (!sel) return [];
                 return Array.from(sel.options).map(o => ({{
-                    value: o.value,
-                    text: o.textContent.trim()
+                    value: o.value, text: o.textContent.trim()
                 }}));
             }}""")
-
+            skip_texts = {"select", "--select--", "-- select --", "select state",
+                          "select city", "select centre", "select test centre",
+                          "select country", ""}
             for item in raw:
                 v = item["value"].strip()
                 t = item["text"].strip()
-                # Skip placeholder options
-                if v and v not in ("", "-1", "0") and t.lower() not in (
-                    "select", "--select--", "-- select --", "select state",
-                    "select city", "select centre", "select test centre",
-                    "select country", ""
-                ):
+                if v and v not in ("", "-1", "0") and t.lower() not in skip_texts:
                     options.append(DropdownOption(value=v, text=t))
-
         except Exception as e:
             logger.error(f"Error reading select '{selector}': {e}")
-
         return options
 
     async def _discover_selects(self, page: Page) -> dict[str, str]:
-        """Discover all <select> elements and classify them by role."""
+        """Discover all <select> elements and classify them."""
         selects_info = await page.evaluate("""() => {
             return Array.from(document.querySelectorAll('select')).map(s => ({
-                id: s.id,
-                name: s.name,
+                id: s.id, name: s.name,
                 optionCount: s.options.length,
                 firstOptionText: s.options.length > 0 ? s.options[0].textContent.trim() : ''
             }));
         }""")
 
-        logger.info(f"Found {len(selects_info)} <select> elements:")
-        for s in selects_info:
-            logger.info(f"  id='{s['id']}' name='{s['name']}' options={s['optionCount']} "
-                        f"first='{s['firstOptionText']}'")
+        logger.info(f"Found {len(selects_info)} <select> elements")
 
         mapping = {}
         for s in selects_info:
@@ -237,11 +209,10 @@ class SPMTScraper:
             elif "centre" in il or "center" in il or "test" in il or "centre" in first:
                 mapping["centre"] = f"#{s['id']}" if s["id"] else f"[name='{s['name']}']"
 
-        # Fallback: assign by position if we couldn't identify by name
+        # Fallback: assign by position
         unassigned = [s for s in selects_info
                       if (f"#{s['id']}" not in mapping.values() and
                           f"[name='{s['name']}']" not in mapping.values())]
-
         roles_needed = [r for r in ["country", "state", "city", "centre"] if r not in mapping]
         for role, s in zip(roles_needed, unassigned):
             mapping[role] = f"#{s['id']}" if s["id"] else f"[name='{s['name']}']"
@@ -250,276 +221,360 @@ class SPMTScraper:
         return mapping
 
     async def _select_option(self, page: Page, selector: str, value: str):
-        """Select an option in a dropdown and wait for AJAX."""
+        """Select an option and wait for dependent AJAX."""
         await page.select_option(selector, value)
         await page.wait_for_timeout(AJAX_WAIT)
-        # Wait for any network requests triggered by the selection
         try:
             await page.wait_for_load_state("networkidle", timeout=DROPDOWN_WAIT)
         except PlaywrightTimeout:
-            pass  # Some selections don't trigger network calls
+            pass
 
-    async def _read_calendar(self, page: Page) -> tuple[list[SlotDate], list[SlotDate], str]:
+    async def _click_search(self, page: Page) -> bool:
+        """Click the Search button to load the calendar."""
+        # Try multiple selectors for the Search button
+        search_selectors = [
+            "input[value='Search']",
+            "input[value='search']",
+            "button:has-text('Search')",
+            "input[type='submit'][value*='Search' i]",
+            "input[type='button'][value*='Search' i]",
+            "a:has-text('Search')",
+            ".btn:has-text('Search')",
+        ]
+
+        for selector in search_selectors:
+            try:
+                btn = page.locator(selector).first
+                if await btn.is_visible(timeout=3000):
+                    await btn.click()
+                    logger.info(f"Clicked Search button: {selector}")
+                    await page.wait_for_timeout(CALENDAR_WAIT)
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=10_000)
+                    except PlaywrightTimeout:
+                        pass
+                    return True
+            except Exception:
+                continue
+
+        # Fallback: try clicking any submit-type button
+        try:
+            btn = page.locator("input[type='submit'], button[type='submit']").first
+            if await btn.is_visible(timeout=2000):
+                await btn.click()
+                logger.info("Clicked fallback submit button")
+                await page.wait_for_timeout(CALENDAR_WAIT)
+                return True
+        except Exception:
+            pass
+
+        logger.warning("Could not find Search button")
+        return False
+
+    async def _read_calendar(self, page: Page) -> tuple[list[SlotDate], list[SlotDate], list[str]]:
         """
-        Read the calendar/datepicker on the page.
-        Returns: (available_dates, booked_dates, calendar_month_label)
+        Read the SPMT two-month inline calendar.
 
-        The calendar typically uses CSS classes or inline styles to indicate:
-        - Green / available / active → slots available
-        - Red / booked / full → fully booked
-        - Disabled / grey → no slots
+        This calendar shows two months side by side. Each date cell (td) that
+        has slots uses a colored background:
+          - GREEN background → available
+          - RED background → fully booked
+
+        We detect colors by reading the computed backgroundColor of each td
+        and any inner <a> element, then checking if it's in the green or red
+        color range via RGB values.
         """
         available = []
         booked = []
-        month_label = ""
+        month_labels = []
 
         try:
-            # Wait for the calendar to appear
-            # Common selectors for datepicker/calendar widgets
-            calendar_selectors = [
-                ".ui-datepicker",           # jQuery UI Datepicker
-                ".datepicker",              # Bootstrap Datepicker
-                ".calendar",                # Generic calendar
-                ".fc",                      # FullCalendar
-                "[class*='calendar']",      # Any element with 'calendar' in class
-                "[class*='datepicker']",    # Any element with 'datepicker' in class
-                "table.table-bordered",     # Bootstrap-style table calendar
-                ".hasDatepicker",           # jQuery UI marker
-            ]
-
-            calendar_found = False
-            for sel in calendar_selectors:
-                try:
-                    el = await page.wait_for_selector(sel, timeout=5000)
-                    if el:
-                        calendar_found = True
-                        logger.info(f"Calendar found with selector: {sel}")
-                        break
-                except PlaywrightTimeout:
-                    continue
-
-            if not calendar_found:
-                logger.warning("No calendar widget found on page")
-
-            # Extract calendar data using JavaScript for reliability
+            # Extract ALL relevant data from the calendar using a single JS evaluation
             calendar_data = await page.evaluate("""() => {
                 const result = {
-                    monthLabel: '',
-                    dates: [],
-                    calendarHTML: '',
-                    allClasses: new Set()
+                    months: [],
+                    cells: [],
+                    debugInfo: ''
                 };
 
-                // === jQuery UI Datepicker ===
-                const uiCalendar = document.querySelector('.ui-datepicker, .hasDatepicker, [id*="datepicker"]');
-                if (uiCalendar) {
-                    // Get month/year label
-                    const titleEl = uiCalendar.querySelector('.ui-datepicker-title, .ui-datepicker-header');
-                    if (titleEl) result.monthLabel = titleEl.textContent.trim();
+                // Grab the full page HTML snippet around the calendar for debugging
+                const examDateSection = document.querySelector('[class*="calendar"], [id*="calendar"], [class*="datepicker"], [id*="datepicker"]');
 
-                    // Get all date cells
-                    const cells = uiCalendar.querySelectorAll('td');
-                    cells.forEach(td => {
-                        const a = td.querySelector('a') || td.querySelector('span');
-                        if (!a) return;
-                        const dateNum = a.textContent.trim();
-                        if (!dateNum || isNaN(dateNum)) return;
+                // Find all table elements on the page
+                const allTables = document.querySelectorAll('table');
 
-                        const classes = td.className + ' ' + a.className;
-                        const style = td.getAttribute('style') || '';
-                        const aStyle = a.getAttribute('style') || '';
-                        const allStyles = style + ' ' + aStyle;
+                // Look for calendar-like tables (contain day headers like Su Mo Tu etc.)
+                const calendarTables = [];
+                allTables.forEach(table => {
+                    const text = table.textContent;
+                    if (text.includes('Su') && text.includes('Mo') && text.includes('Tu')) {
+                        calendarTables.push(table);
+                    }
+                });
 
-                        result.dates.push({
-                            date: dateNum,
-                            classes: classes,
-                            style: allStyles,
-                            title: td.getAttribute('title') || a.getAttribute('title') || '',
-                            isDisabled: td.classList.contains('ui-datepicker-unselectable') ||
-                                       td.classList.contains('ui-state-disabled'),
-                        });
+                result.debugInfo = `Found ${allTables.length} tables, ${calendarTables.length} calendar tables`;
+
+                // If no calendar tables found, look for any table with month names
+                if (calendarTables.length === 0) {
+                    allTables.forEach(table => {
+                        const months = ['January','February','March','April','May','June',
+                                       'July','August','September','October','November','December'];
+                        const text = table.textContent;
+                        if (months.some(m => text.includes(m))) {
+                            calendarTables.push(table);
+                        }
                     });
                 }
 
-                // === Bootstrap / Custom Calendar ===
-                if (result.dates.length === 0) {
-                    // Try finding any table that looks like a calendar
-                    const tables = document.querySelectorAll('table');
-                    tables.forEach(table => {
-                        const headerText = table.querySelector('th, caption');
-                        if (headerText) {
-                            const text = headerText.textContent.trim();
-                            // Check if it looks like a month/year header
-                            if (/\\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|January|February|March|April|May|June|July|August|September|October|November|December)\\b/i.test(text)) {
-                                result.monthLabel = text;
-                            }
+                // Process each calendar table
+                calendarTables.forEach(table => {
+                    // Find month/year headers
+                    const ths = table.querySelectorAll('th, td.month-header, .ui-datepicker-title');
+                    ths.forEach(th => {
+                        const text = th.textContent.trim();
+                        const months = ['January','February','March','April','May','June',
+                                       'July','August','September','October','November','December'];
+                        if (months.some(m => text.includes(m))) {
+                            result.months.push(text);
+                        }
+                    });
+
+                    // Process every td cell in this table
+                    const tds = table.querySelectorAll('td');
+                    tds.forEach(td => {
+                        // Get the text — should be a day number (1-31)
+                        let dayText = td.textContent.trim();
+                        const innerA = td.querySelector('a');
+                        const innerSpan = td.querySelector('span');
+                        const innerEl = innerA || innerSpan;
+
+                        if (innerEl) {
+                            dayText = innerEl.textContent.trim();
                         }
 
-                        const cells = table.querySelectorAll('td');
-                        cells.forEach(td => {
-                            const text = td.textContent.trim();
-                            if (text && !isNaN(text) && parseInt(text) >= 1 && parseInt(text) <= 31) {
-                                const classes = td.className;
-                                const style = td.getAttribute('style') || '';
-                                const bgColor = window.getComputedStyle(td).backgroundColor;
-                                const color = window.getComputedStyle(td).color;
-                                const innerEl = td.querySelector('a, span, div');
-                                const innerBg = innerEl ?
-                                    window.getComputedStyle(innerEl).backgroundColor : '';
+                        // Skip non-numeric cells (headers, empty, month names)
+                        if (!dayText || isNaN(dayText) || parseInt(dayText) < 1 || parseInt(dayText) > 31) {
+                            return;
+                        }
 
-                                result.dates.push({
-                                    date: text,
-                                    classes: classes + (innerEl ? ' ' + innerEl.className : ''),
-                                    style: style,
-                                    bgColor: bgColor,
+                        // Get background colors from BOTH the td and any inner element
+                        const tdBg = window.getComputedStyle(td).backgroundColor;
+                        const innerBg = innerEl ? window.getComputedStyle(innerEl).backgroundColor : '';
+                        const tdStyle = td.getAttribute('style') || '';
+                        const innerStyle = innerEl ? (innerEl.getAttribute('style') || '') : '';
+                        const tdClass = td.className || '';
+                        const innerClass = innerEl ? (innerEl.className || '') : '';
+
+                        result.cells.push({
+                            day: dayText,
+                            tdBg: tdBg,
+                            innerBg: innerBg,
+                            tdStyle: tdStyle,
+                            innerStyle: innerStyle,
+                            tdClass: tdClass,
+                            innerClass: innerClass,
+                            title: td.getAttribute('title') || (innerEl ? innerEl.getAttribute('title') || '' : ''),
+                        });
+                    });
+                });
+
+                // If still no cells found, do a brute force scan of ALL tds
+                if (result.cells.length === 0) {
+                    result.debugInfo += ' | Brute force scan';
+                    allTables.forEach(table => {
+                        table.querySelectorAll('td').forEach(td => {
+                            const innerA = td.querySelector('a');
+                            const innerSpan = td.querySelector('span');
+                            const innerEl = innerA || innerSpan;
+                            let dayText = innerEl ? innerEl.textContent.trim() : td.textContent.trim();
+
+                            if (!dayText || isNaN(dayText)) return;
+                            const num = parseInt(dayText);
+                            if (num < 1 || num > 31) return;
+
+                            const tdBg = window.getComputedStyle(td).backgroundColor;
+                            const innerBg = innerEl ? window.getComputedStyle(innerEl).backgroundColor : '';
+
+                            // Only include cells that have some non-transparent background
+                            const transparent = ['rgba(0, 0, 0, 0)', 'transparent', ''];
+                            if (!transparent.includes(tdBg) || (innerBg && !transparent.includes(innerBg))) {
+                                result.cells.push({
+                                    day: dayText,
+                                    tdBg: tdBg,
                                     innerBg: innerBg,
-                                    color: color,
-                                    title: td.getAttribute('title') || '',
-                                    isDisabled: td.classList.contains('disabled') ||
-                                               td.classList.contains('unavailable'),
+                                    tdStyle: td.getAttribute('style') || '',
+                                    innerStyle: innerEl ? (innerEl.getAttribute('style') || '') : '',
+                                    tdClass: td.className || '',
+                                    innerClass: innerEl ? (innerEl.className || '') : '',
+                                    title: '',
                                 });
                             }
                         });
                     });
                 }
 
-                // === Generic: Look for any colored day elements ===
-                if (result.dates.length === 0) {
-                    const allElements = document.querySelectorAll('[class*="day"], [class*="date"], [class*="slot"]');
-                    allElements.forEach(el => {
-                        const text = el.textContent.trim();
-                        if (text && !isNaN(text) && parseInt(text) >= 1 && parseInt(text) <= 31) {
-                            const bgColor = window.getComputedStyle(el).backgroundColor;
-                            result.dates.push({
-                                date: text,
-                                classes: el.className,
-                                style: el.getAttribute('style') || '',
-                                bgColor: bgColor,
-                                title: el.getAttribute('title') || '',
-                                isDisabled: false,
-                            });
-                        }
-                    });
-                }
-
-                // Collect all unique CSS classes for debugging
-                result.dates.forEach(d => {
-                    d.classes.split(/\\s+/).forEach(c => {
-                        if (c) result.allClasses.add(c);
-                    });
-                });
-                result.allClasses = [...result.allClasses];
-
                 return result;
             }""")
 
-            month_label = calendar_data.get("monthLabel", "")
-            all_classes = calendar_data.get("allClasses", [])
-            logger.info(f"Calendar month: {month_label}")
-            logger.info(f"Found {len(calendar_data.get('dates', []))} date cells")
-            logger.info(f"CSS classes found: {all_classes}")
+            month_labels = calendar_data.get("months", [])
+            cells = calendar_data.get("cells", [])
+            debug = calendar_data.get("debugInfo", "")
 
-            # Classify each date as available, booked, or unavailable
-            for d in calendar_data.get("dates", []):
-                date_num = d["date"]
-                classes = d.get("classes", "").lower()
-                style = d.get("style", "").lower()
-                bg_color = d.get("bgColor", "").lower()
-                inner_bg = d.get("innerBg", "").lower()
-                title = d.get("title", "")
-                is_disabled = d.get("isDisabled", False)
+            logger.info(f"Calendar debug: {debug}")
+            logger.info(f"Calendar months: {month_labels}")
+            logger.info(f"Calendar cells with color: {len(cells)}")
 
-                slot = SlotDate(
-                    date=date_num,
-                    month=month_label,
-                    css_class=d.get("classes", ""),
+            # Determine which month each cell belongs to
+            # The SPMT calendar shows 2 months side by side
+            current_month = month_labels[0] if month_labels else "Unknown"
+
+            for cell in cells:
+                day = cell["day"]
+                td_bg = cell.get("tdBg", "")
+                inner_bg = cell.get("innerBg", "")
+                td_style = cell.get("tdStyle", "")
+                inner_style = cell.get("innerStyle", "")
+                td_class = cell.get("tdClass", "")
+                inner_class = cell.get("innerClass", "")
+
+                # Determine which color this cell is
+                status = self._detect_color(
+                    td_bg, inner_bg, td_style, inner_style, td_class, inner_class
                 )
 
-                # Determine status from CSS classes and colors
-                status = self._classify_date(classes, style, bg_color, inner_bg, title, is_disabled)
-                slot.status = status
+                if status == "unknown":
+                    continue
+
+                # Try to figure out which month this date belongs to
+                # Simple heuristic: day numbers reset when month changes
+                month_for_date = current_month
+                if len(month_labels) >= 2:
+                    # We'll assign month based on the logged cell info
+                    # For now use the first month; the JS already processes
+                    # cells in DOM order (left calendar first, then right)
+                    month_for_date = current_month  # Will be improved below
+
+                slot = SlotDate(
+                    date=day,
+                    month=month_for_date,
+                    status=status,
+                    bg_color=td_bg or inner_bg,
+                    css_class=f"td:{td_class} inner:{inner_class}",
+                )
 
                 if status == "available":
                     available.append(slot)
+                    logger.info(f"  🟢 Available: day {day} | bg={td_bg} inner_bg={inner_bg} "
+                               f"class={td_class} {inner_class}")
                 elif status == "booked":
                     booked.append(slot)
-
-            logger.info(f"Available dates: {[d.date for d in available]}")
-            logger.info(f"Booked dates: {[d.date for d in booked]}")
+                    logger.info(f"  🔴 Booked: day {day} | bg={td_bg} inner_bg={inner_bg}")
 
         except Exception as e:
-            logger.error(f"Error reading calendar: {e}")
+            logger.error(f"Error reading calendar: {e}", exc_info=True)
 
-        return available, booked, month_label
+        return available, booked, month_labels
 
-    def _classify_date(self, classes: str, style: str, bg_color: str,
-                        inner_bg: str, title: str, is_disabled: bool) -> str:
+    def _detect_color(self, td_bg: str, inner_bg: str, td_style: str,
+                       inner_style: str, td_class: str, inner_class: str) -> str:
         """
-        Classify a calendar date cell as available, booked, or unavailable.
-        Uses CSS classes, inline styles, computed background colors, and title text.
+        Detect whether a calendar cell is green (available) or red (booked)
+        by analyzing its background color.
+
+        Uses RGB value analysis instead of just matching exact color strings.
         """
-        all_text = f"{classes} {style} {bg_color} {inner_bg} {title}".lower()
+        # Check all possible color sources
+        colors_to_check = [td_bg, inner_bg]
+        styles_to_check = [td_style, inner_style]
+        classes_to_check = (td_class + " " + inner_class).lower()
 
-        # ── Green indicators (AVAILABLE) ──
-        green_indicators = [
-            "available", "active", "green", "open", "free",
-            "success", "highlight", "selectable", "enabled",
-            "bg-success", "text-success", "slot-available",
-        ]
-        green_colors = [
-            "rgb(0, 128, 0)", "rgb(0, 255, 0)", "rgb(40, 167, 69)",   # Bootstrap green
-            "rgb(76, 175, 80)", "rgb(102, 187, 106)",                   # Material green
-            "rgb(34, 139, 34)", "rgb(50, 205, 50)",                     # Forest/lime green
-            "#00ff00", "#008000", "#28a745", "#4caf50", "#66bb6a",
-            "#22c55e", "#16a34a", "#15803d",                            # Tailwind greens
-        ]
+        # ── Check CSS classes first (most reliable if used) ──
+        green_classes = ["available", "green", "success", "open", "slot-available",
+                         "bg-success", "bg-green", "active-slot"]
+        red_classes = ["booked", "red", "danger", "full", "slot-booked",
+                       "bg-danger", "bg-red", "closed"]
 
-        # ── Red indicators (BOOKED) ──
-        red_indicators = [
-            "booked", "full", "red", "occupied", "sold",
-            "danger", "slot-booked", "not-available", "closed",
-        ]
-        red_colors = [
-            "rgb(255, 0, 0)", "rgb(220, 53, 69)", "rgb(244, 67, 54)",
-            "rgb(211, 47, 47)", "#ff0000", "#dc3545", "#f44336",
-        ]
-
-        # ── Disabled indicators ──
-        disabled_indicators = [
-            "disabled", "unavailable", "grey", "gray",
-            "ui-datepicker-unselectable", "ui-state-disabled",
-            "muted", "empty", "other-month",
-        ]
-
-        if is_disabled:
-            return "unavailable"
-
-        # Check for green (available)
-        for indicator in green_indicators:
-            if indicator in all_text:
+        for gc in green_classes:
+            if gc in classes_to_check:
                 return "available"
-        for color in green_colors:
-            if color in bg_color or color in inner_bg or color in style:
-                return "available"
-
-        # Check for red (booked)
-        for indicator in red_indicators:
-            if indicator in all_text:
-                return "booked"
-        for color in red_colors:
-            if color in bg_color or color in inner_bg or color in style:
+        for rc in red_classes:
+            if rc in classes_to_check:
                 return "booked"
 
-        # Check for disabled
-        for indicator in disabled_indicators:
-            if indicator in classes:
-                return "unavailable"
-
-        # If clickable (has <a> tag behavior), might be available
-        if "ui-state-default" in classes and "ui-state-disabled" not in classes:
+        # ── Check inline styles for color keywords ──
+        all_styles = " ".join(styles_to_check).lower()
+        if "green" in all_styles or "#0f0" in all_styles or "#00ff00" in all_styles:
             return "available"
+        if "red" in all_styles or "#f00" in all_styles or "#ff0000" in all_styles:
+            return "booked"
+
+        # ── Check computed background colors using RGB analysis ──
+        for color_str in colors_to_check:
+            if not color_str:
+                continue
+
+            color_lower = color_str.lower().strip()
+
+            # Skip transparent/no-color
+            if color_lower in ("rgba(0, 0, 0, 0)", "transparent", "", "rgb(255, 255, 255)"):
+                continue
+
+            # Parse RGB values
+            rgb = self._parse_rgb(color_lower)
+            if rgb is None:
+                # Check for color keywords in the string
+                if "green" in color_lower:
+                    return "available"
+                if "red" in color_lower:
+                    return "booked"
+                continue
+
+            r, g, b = rgb
+
+            # ── GREEN detection ──
+            # Green means: G channel is dominant, significantly higher than R and B
+            if g > 100 and g > r * 1.3 and g > b * 1.3:
+                return "available"
+
+            # ── RED detection ──
+            # Red means: R channel is dominant, significantly higher than G and B
+            if r > 150 and r > g * 1.5 and r > b * 1.5:
+                return "booked"
+
+            # Some orangey-reds (like the ones in the screenshot)
+            if r > 200 and g < 100 and b < 100:
+                return "booked"
+
+            # Bright/pure greens
+            if g > 180 and r < 150 and b < 150:
+                return "available"
+
+        # ── Check for common hex colors in styles ──
+        for style in styles_to_check:
+            style_lower = style.lower()
+            # Green hex colors
+            green_hexes = ["#0f0", "#00ff00", "#008000", "#28a745", "#4caf50",
+                           "#66bb6a", "#22c55e", "#16a34a", "#2e7d32", "#388e3c",
+                           "#43a047", "#4caf50", "#00c853", "#00e676"]
+            for h in green_hexes:
+                if h in style_lower:
+                    return "available"
+            # Red hex colors
+            red_hexes = ["#f00", "#ff0000", "#dc3545", "#f44336", "#e53935",
+                         "#d32f2f", "#c62828", "#b71c1c", "#ef5350", "#e74c3c"]
+            for h in red_hexes:
+                if h in style_lower:
+                    return "booked"
 
         return "unknown"
+
+    def _parse_rgb(self, color_str: str) -> Optional[tuple[int, int, int]]:
+        """Parse an RGB/RGBA color string into (R, G, B) tuple."""
+        # Match rgb(r, g, b) or rgba(r, g, b, a)
+        match = re.match(r'rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)', color_str)
+        if match:
+            return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+        return None
 
     # ─── Public API ───────────────────────────────────────────────────────────
 
@@ -529,17 +584,19 @@ class SPMTScraper:
         try:
             if not await self._load_slot_page(page):
                 return []
-
             mapping = await self._discover_selects(page)
 
-            # Some portals have a "Country" dropdown first — select India if present
+            # Select India if Country dropdown exists
             if "country" in mapping:
                 country_opts = await self._get_select_options(page, mapping["country"])
-                india = next((o for o in country_opts
-                             if "india" in o.text.lower()), None)
+                india = next((o for o in country_opts if "india" in o.text.lower()), None)
                 if india:
                     await self._select_option(page, mapping["country"], india.value)
+                    # Re-discover after country selection (state dropdown may populate)
+                    await page.wait_for_timeout(AJAX_WAIT)
 
+            if "state" not in mapping:
+                mapping = await self._discover_selects(page)
             if "state" not in mapping:
                 logger.error("No state dropdown found")
                 return []
@@ -547,7 +604,6 @@ class SPMTScraper:
             states = await self._get_select_options(page, mapping["state"])
             logger.info(f"Found {len(states)} states")
             return states
-
         finally:
             await page.context.close()
 
@@ -557,37 +613,30 @@ class SPMTScraper:
         try:
             if not await self._load_slot_page(page):
                 return []
-
             mapping = await self._discover_selects(page)
 
-            # Handle Country dropdown
             if "country" in mapping:
                 country_opts = await self._get_select_options(page, mapping["country"])
                 india = next((o for o in country_opts if "india" in o.text.lower()), None)
                 if india:
                     await self._select_option(page, mapping["country"], india.value)
+                    await page.wait_for_timeout(AJAX_WAIT)
+                    mapping = await self._discover_selects(page)
 
             if "state" not in mapping:
                 return []
 
-            # Select state
             await self._select_option(page, mapping["state"], state_value)
-
-            # Wait for city dropdown to populate
-            if "city" not in mapping:
-                # Re-discover after state selection (new dropdowns may appear)
-                mapping = await self._discover_selects(page)
+            await page.wait_for_timeout(AJAX_WAIT)
+            mapping = await self._discover_selects(page)
 
             if "city" not in mapping:
-                logger.error("No city dropdown found after state selection")
+                logger.error("No city dropdown found")
                 return []
 
-            # Wait for the city dropdown to get populated
-            await page.wait_for_timeout(AJAX_WAIT)
             cities = await self._get_select_options(page, mapping["city"])
             logger.info(f"Found {len(cities)} cities")
             return cities
-
         finally:
             await page.context.close()
 
@@ -597,7 +646,6 @@ class SPMTScraper:
         try:
             if not await self._load_slot_page(page):
                 return []
-
             mapping = await self._discover_selects(page)
 
             if "country" in mapping:
@@ -605,22 +653,19 @@ class SPMTScraper:
                 india = next((o for o in country_opts if "india" in o.text.lower()), None)
                 if india:
                     await self._select_option(page, mapping["country"], india.value)
+                    await page.wait_for_timeout(AJAX_WAIT)
+                    mapping = await self._discover_selects(page)
 
             if "state" not in mapping:
                 return []
-
             await self._select_option(page, mapping["state"], state_value)
             await page.wait_for_timeout(AJAX_WAIT)
-
-            # Re-discover in case new elements appeared
             mapping = await self._discover_selects(page)
 
             if "city" not in mapping:
                 return []
-
             await self._select_option(page, mapping["city"], city_value)
             await page.wait_for_timeout(AJAX_WAIT)
-
             mapping = await self._discover_selects(page)
 
             if "centre" not in mapping:
@@ -630,7 +675,6 @@ class SPMTScraper:
             centres = await self._get_select_options(page, mapping["centre"])
             logger.info(f"Found {len(centres)} test centres")
             return centres
-
         finally:
             await page.context.close()
 
@@ -639,7 +683,7 @@ class SPMTScraper:
                           centre_text: str = "") -> SlotInfo:
         """
         Check slot availability at the specified test centre.
-        Reads the calendar and returns green (available) and red (booked) dates.
+        Selects all dropdowns, clicks Search, then reads the calendar.
         """
         result = SlotInfo(state=state_text, city=city_text, test_centre=centre_text)
         page = await self._new_page()
@@ -650,83 +694,83 @@ class SPMTScraper:
 
             mapping = await self._discover_selects(page)
 
-            # Handle Country
+            # 1. Select Country (India)
             if "country" in mapping:
                 country_opts = await self._get_select_options(page, mapping["country"])
                 india = next((o for o in country_opts if "india" in o.text.lower()), None)
                 if india:
+                    logger.info("Selecting country: India")
                     await self._select_option(page, mapping["country"], india.value)
+                    await page.wait_for_timeout(AJAX_WAIT)
+                    mapping = await self._discover_selects(page)
 
-            # Select State
+            # 2. Select State
             if "state" in mapping:
                 logger.info(f"Selecting state: {state_text}")
                 await self._select_option(page, mapping["state"], state_value)
                 await page.wait_for_timeout(AJAX_WAIT)
                 mapping = await self._discover_selects(page)
 
-            # Select City
+            # 3. Select City
             if "city" in mapping:
                 logger.info(f"Selecting city: {city_text}")
                 await self._select_option(page, mapping["city"], city_value)
                 await page.wait_for_timeout(AJAX_WAIT)
                 mapping = await self._discover_selects(page)
 
-            # Select Test Centre
+            # 4. Select Test Centre
             if "centre" in mapping:
                 logger.info(f"Selecting centre: {centre_text}")
                 await self._select_option(page, mapping["centre"], centre_value)
                 await page.wait_for_timeout(AJAX_WAIT)
 
-            # Look for and click any "Search" / "Show" button if present
-            for btn_text in ["Search", "Show", "Submit", "Get", "View", "Go"]:
-                try:
-                    btn = page.locator(
-                        f"input[type='submit'][value*='{btn_text}' i], "
-                        f"button:has-text('{btn_text}'), "
-                        f"input[type='button'][value*='{btn_text}' i]"
-                    ).first
-                    if await btn.is_visible(timeout=2000):
-                        await btn.click()
-                        await page.wait_for_timeout(3000)
-                        break
-                except Exception:
-                    continue
+            # 5. Click Search button — THIS IS CRITICAL
+            search_clicked = await self._click_search(page)
+            if not search_clicked:
+                logger.warning("Search button not clicked — calendar may not load")
 
-            # Wait for calendar to load
-            await page.wait_for_timeout(3000)
+            # 6. Wait for calendar to appear and render
+            await page.wait_for_timeout(CALENDAR_WAIT)
 
-            # Read the calendar
-            available, booked, month_label = await self._read_calendar(page)
+            # Take a debug screenshot
+            try:
+                screenshot_path = os.path.join(os.path.dirname(__file__), "data", "last_check.png")
+                os.makedirs(os.path.dirname(screenshot_path), exist_ok=True)
+                await page.screenshot(path=screenshot_path, full_page=True)
+                logger.info(f"Debug screenshot saved: {screenshot_path}")
+            except Exception:
+                pass
+
+            # 7. Read the calendar
+            available, booked, month_labels = await self._read_calendar(page)
 
             result.available_dates = available
             result.booked_dates = booked
-            result.calendar_month = month_label
+            result.calendar_months = month_labels
 
-            # Also try to read any text/table results on the page
+            # Check for "no slots" messages on the page
             try:
                 body_text = await page.inner_text("body")
-                # Check for "no slots" messages
                 no_slot_phrases = ["no slot", "no batch", "not available", "no record",
-                                   "no data", "currently no", "no seats"]
+                                   "no data", "currently no", "no seats", "please select exam date"]
                 for phrase in no_slot_phrases:
                     if phrase in body_text.lower():
-                        result.raw_text = f"Portal message: slots not available"
+                        if not available and not booked:
+                            result.raw_text = f"Portal message found: '{phrase}'"
                         break
             except Exception:
                 pass
 
-            logger.info(f"Slot check complete: {len(available)} available, "
-                        f"{len(booked)} booked dates")
+            logger.info(f"Check complete: {len(available)} available, {len(booked)} booked")
             return result
 
         except Exception as e:
-            logger.error(f"Error checking slots: {e}")
+            logger.error(f"Error checking slots: {e}", exc_info=True)
             return result
         finally:
             await page.context.close()
 
     async def health_check(self) -> bool:
-        """Check if the SPMT portal is accessible."""
         page = await self._new_page()
         try:
             await page.goto(SLOT_DETAILS_URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)

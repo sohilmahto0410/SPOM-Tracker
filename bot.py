@@ -475,8 +475,8 @@ async def _do_check(chat_id: int, bot):
                 f"📍 {cfg['centre_text']}\n"
                 f"🏙️ {cfg['city_text']}, {cfg['state_text']}\n"
             )
-            if slot_info.calendar_month:
-                msg += f"📅 Calendar showing: {slot_info.calendar_month}\n"
+            if slot_info.calendar_months:
+                msg += f"📅 Calendar: {', '.join(slot_info.calendar_months)}\n"
             if slot_info.booked_dates:
                 booked_str = ", ".join(d.date for d in slot_info.booked_dates[:10])
                 msg += f"🔴 Booked dates: {booked_str}\n"
@@ -511,8 +511,8 @@ async def _do_check(chat_id: int, bot):
                 f"🏢 *{cfg['centre_text']}*\n"
                 f"🏙️ {cfg['city_text']}, {cfg['state_text']}\n"
             )
-            if slot_info.calendar_month:
-                msg += f"📅 {slot_info.calendar_month}\n"
+            if slot_info.calendar_months:
+                msg += f"📅 {', '.join(slot_info.calendar_months)}\n"
             msg += (
                 f"\n🆕 *New green dates:* {dates_str}\n"
                 f"🟢 All available dates: {all_dates_str}\n"
