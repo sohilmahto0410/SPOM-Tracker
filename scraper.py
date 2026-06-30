@@ -101,22 +101,35 @@ class SPMTScraper:
     Reads the inline calendar to detect green (available) and red (booked) dates.
     """
 
-    def __init__(self):
+    def __init__(self, chromium_path: str = ""):
         self._playwright = None
         self._browser: Optional[Browser] = None
+        self._chromium_path = chromium_path or os.getenv("CHROMIUM_EXECUTABLE_PATH", "")
 
     async def _ensure_browser(self) -> Browser:
         if self._browser is None or not self._browser.is_connected():
             self._playwright = await async_playwright().start()
-            self._browser = await self._playwright.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--disable-extensions",
-                ],
-            )
+
+            launch_args = [
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-extensions",
+                "--single-process",
+            ]
+
+            launch_kwargs = {
+                "headless": True,
+                "args": launch_args,
+            }
+
+            # Use custom Chromium binary if provided
+            if self._chromium_path:
+                launch_kwargs["executable_path"] = self._chromium_path
+                logger.info(f"Using custom Chromium: {self._chromium_path}")
+
+            self._browser = await self._playwright.chromium.launch(**launch_kwargs)
             logger.info("Browser launched")
         return self._browser
 

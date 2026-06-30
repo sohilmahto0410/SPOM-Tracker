@@ -95,7 +95,7 @@ def save_seen_slots(seen: dict):
 
 
 # ─── Scraper Instance ────────────────────────────────────────────────────────
-scraper = SPMTScraper()
+scraper = SPMTScraper(chromium_path=chromium_path)
 
 
 # ─── Telegram Command Handlers ────────────────────────────────────────────────
