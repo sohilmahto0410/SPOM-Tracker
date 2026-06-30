@@ -202,6 +202,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _handle_state_selection(query, chat_id: str, data: str):
     """User selected a state → fetch cities."""
+    import traceback
     parts = data.split(":", 2)
     state_value = parts[1]
     state_text = parts[2] if len(parts) > 2 else state_value
@@ -212,23 +213,34 @@ async def _handle_state_selection(query, chat_id: str, data: str):
         "state_text": state_text,
     }
 
-    await query.edit_message_text(
-        f"✅ State: {state_text}\n\n🔄 Fetching cities..."
-    )
+    # Edit the original message to show selection
+    try:
+        await query.edit_message_text(
+            f"✅ State: {state_text}\n\n🔄 Fetching cities... (this takes 20-40 seconds)"
+        )
+    except Exception:
+        pass
+
+    bot = query.get_bot()
+    chat = query.message.chat_id
 
     try:
         cache_key = state_value
         if cache_key in dropdown_cache["cities"]:
             cities = dropdown_cache["cities"][cache_key]
         else:
+            logger.info(f"Fetching cities for state: {state_text} ({state_value})")
             cities = await scraper.get_cities(state_value)
             dropdown_cache["cities"][cache_key] = cities
 
         if not cities:
-            await query.edit_message_text(
-                f"✅ State: {state_text}\n\n"
-                "❌ No cities found. Portal may not have data for this state.\n"
-                "Try /setup for a different state."
+            await bot.send_message(
+                chat_id=chat,
+                text=(
+                    f"✅ State: {state_text}\n\n"
+                    "❌ No cities found. Portal may not have data for this state.\n"
+                    "Try /setup for a different state."
+                ),
             )
             return
 
@@ -245,21 +257,33 @@ async def _handle_state_selection(query, chat_id: str, data: str):
         if row:
             keyboard.append(row)
 
-        await query.edit_message_text(
-            f"✅ State: *{state_text}*\n\n"
-            f"📍 *Step 2/3: Select your City*\n"
-            f"Found {len(cities)} cities:",
+        await bot.send_message(
+            chat_id=chat,
+            text=(
+                f"✅ State: *{state_text}*\n\n"
+                f"📍 *Step 2/3: Select your City*\n"
+                f"Found {len(cities)} cities:"
+            ),
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown",
         )
 
     except Exception as e:
-        logger.error(f"City fetch error: {e}")
-        await query.edit_message_text(f"❌ Error: {e}\nTry /setup again.")
+        error_msg = f"City fetch error: {e}"
+        logger.error(error_msg)
+        logger.error(traceback.format_exc())
+        try:
+            await bot.send_message(
+                chat_id=chat,
+                text=f"❌ Error fetching cities: {str(e)[:300]}\n\nTry /setup again.",
+            )
+        except Exception:
+            pass
 
 
 async def _handle_city_selection(query, chat_id: str, data: str):
     """User selected a city → fetch test centres."""
+    import traceback
     parts = data.split(":", 2)
     city_value = parts[1]
     city_text = parts[2] if len(parts) > 2 else city_value
@@ -271,9 +295,16 @@ async def _handle_city_selection(query, chat_id: str, data: str):
     user_setup_state[chat_id] = setup
 
     state_text = setup.get("state_text", "?")
-    await query.edit_message_text(
-        f"✅ State: {state_text}\n✅ City: {city_text}\n\n🔄 Fetching test centres..."
-    )
+
+    try:
+        await query.edit_message_text(
+            f"✅ State: {state_text}\n✅ City: {city_text}\n\n🔄 Fetching test centres... (20-40 seconds)"
+        )
+    except Exception:
+        pass
+
+    bot = query.get_bot()
+    chat = query.message.chat_id
 
     try:
         state_value = setup["state_value"]
@@ -281,13 +312,17 @@ async def _handle_city_selection(query, chat_id: str, data: str):
         if cache_key in dropdown_cache["centres"]:
             centres = dropdown_cache["centres"][cache_key]
         else:
+            logger.info(f"Fetching centres for {city_text} in {state_text}")
             centres = await scraper.get_test_centres(state_value, city_value)
             dropdown_cache["centres"][cache_key] = centres
 
         if not centres:
-            await query.edit_message_text(
-                f"✅ State: {state_text}\n✅ City: {city_text}\n\n"
-                "❌ No test centres found. Try /setup."
+            await bot.send_message(
+                chat_id=chat,
+                text=(
+                    f"✅ State: {state_text}\n✅ City: {city_text}\n\n"
+                    "❌ No test centres found. Try /setup."
+                ),
             )
             return
 
@@ -298,18 +333,28 @@ async def _handle_city_selection(query, chat_id: str, data: str):
                 cb_data = f"ce:{centre.value}:{centre.text[:25]}"
             keyboard.append([InlineKeyboardButton(centre.text, callback_data=cb_data)])
 
-        await query.edit_message_text(
-            f"✅ State: *{state_text}*\n"
-            f"✅ City: *{city_text}*\n\n"
-            f"📍 *Step 3/3: Select Test Centre*\n"
-            f"Found {len(centres)} centres:",
+        await bot.send_message(
+            chat_id=chat,
+            text=(
+                f"✅ State: *{state_text}*\n"
+                f"✅ City: *{city_text}*\n\n"
+                f"📍 *Step 3/3: Select Test Centre*\n"
+                f"Found {len(centres)} centres:"
+            ),
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown",
         )
 
     except Exception as e:
         logger.error(f"Centre fetch error: {e}")
-        await query.edit_message_text(f"❌ Error: {e}\nTry /setup again.")
+        logger.error(traceback.format_exc())
+        try:
+            await bot.send_message(
+                chat_id=chat,
+                text=f"❌ Error fetching centres: {str(e)[:300]}\n\nTry /setup again.",
+            )
+        except Exception:
+            pass
 
 
 async def _handle_centre_selection(query, chat_id: str, data: str):
